@@ -181,10 +181,9 @@ opt-level = 0
 split-debuginfo = "unpacked"
 
 [profile.release]
-codegen-units = 1
-opt-level = 3
-lto = "thin"
-# Split debuginfo on macOS for faster linking (ignored on other platforms)
+codegen-units = 64
+opt-level = 2
+lto = false
 split-debuginfo = "unpacked"
 
 [profile.test]

@@ -28,9 +28,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis", "deb", "rpm", "appimage"],
+    "targets": [
+      "nsis"
+    ],
     "category": "Productivity",
-    "externalBin": ["binaries/donut-proxy", "binaries/xray"],
+    "externalBin": [
+      "binaries/donut-proxy",
+      "binaries/xray"
+    ],
     "resources": {
       "binaries/xray-LICENSE.txt": "licenses/Xray-core-LICENSE.txt"
     },
@@ -54,11 +59,19 @@
     "linux": {
       "deb": {
         "desktopTemplate": "donutbrowser.desktop",
-        "depends": ["xdg-utils", "libxdo3", "libayatana-appindicator3-1"]
+        "depends": [
+          "xdg-utils",
+          "libxdo3",
+          "libayatana-appindicator3-1"
+        ]
       },
       "rpm": {
         "desktopTemplate": "donutbrowser.desktop",
-        "depends": ["xdg-utils", "libxdo", "libayatana-appindicator-gtk3"]
+        "depends": [
+          "xdg-utils",
+          "libxdo",
+          "libayatana-appindicator-gtk3"
+        ]
       },
       "appimage": {
         "files": {
@@ -78,7 +91,10 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["http", "https"]
+        "schemes": [
+          "http",
+          "https"
+        ]
       }
     }
   }

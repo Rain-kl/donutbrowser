@@ -27,9 +27,6 @@ const NONE: Entitlements = {
 // Mirror of PLAN_CAPABILITIES in apps/backend/src/plans/entitlements.ts. Keep in
 // sync — a new plan must be declared here too, or it falls back to DEFAULT_PAID.
 const PLAN_CAPABILITIES: Record<string, Capabilities> = {
-  // The one row where cookieBot, browserAutomation and remoteInteractive all
-  // disagree: solo pays for a nightly bot and nothing else that drives a
-  // browser. No fingerprint editing either.
   solo: {
     browserAutomation: false,
     crossOsFingerprints: false,
@@ -75,29 +72,40 @@ const DEFAULT_PAID: Capabilities = {
 };
 
 /**
- * The user's effective entitlements. Prefers the backend-resolved object the
- * desktop attaches to CloudUser; only falls back to deriving from the plan
- * fields when it's missing (older cached state). The fallback mirrors the
- * backend matrix in `apps/backend/src/plans/entitlements.ts`.
+ * The user's effective entitlements.
+ *
+ * TESTING OVERRIDE:
+ * Always return Pro-level entitlements, including when there is no cloud user
+ * and regardless of any entitlements returned by the backend.
+ *
+ * The original entitlement resolution logic is kept commented below so this
+ * temporary testing override can be reverted easily later.
  */
 export function getEntitlements(
   user: CloudUser | null | undefined,
 ): Entitlements {
+  // -------------------------------------------------------------------------
+  // TEMP: FORCE PRO FOR ALL USERS / SIGNED-OUT STATE DURING LOCAL TESTING.
+  // Remove this return and uncomment the original logic below to restore
+  // normal entitlement handling.
+  // -------------------------------------------------------------------------
+  return {
+    active: true,
+    browserAutomation: true,
+    crossOsFingerprints: true,
+    cloudBackup: true,
+    teamCollaboration: true,
+    cookieBot: true,
+    remoteInteractive: true,
+    profileLimit: 1000,
+    requestsPerHour: DEFAULT_REQUESTS_PER_HOUR,
+    remoteBrowserHours: 1000,
+  };
+
+  /*
+  // ORIGINAL LOGIC — temporarily disabled for local Pro testing.
   if (user?.entitlements) {
     const server = user.entitlements;
-    // A backend (or a cached login) older than the current release omits these
-    // keys. Reading them as `undefined` would hide a paid feature from a paying
-    // customer with nothing logged anywhere, so resolve them here — the one
-    // place every caller already goes through.
-    //
-    // Both absent flags fall back to `browserAutomation`, which is what they
-    // were derived from before solo existed: on every plan a pre-solo backend
-    // knows about, automation implied both the bot and interactive remote
-    // control. A solo user never hits this branch — the backend that can put
-    // them on solo is by definition new enough to send both keys.
-    //
-    // `remoteBrowserHours` stays 0 because the spendable figure is whatever
-    // `get_remote_hours_quota` reports, never a client guess.
     return {
       ...server,
       cookieBot: server.cookieBot ?? server.browserAutomation,
@@ -105,6 +113,7 @@ export function getEntitlements(
       remoteBrowserHours: server.remoteBrowserHours ?? 0,
     };
   }
+
   if (!user) return NONE;
 
   const active =
@@ -125,6 +134,7 @@ export function getEntitlements(
     requestsPerHour: caps.browserAutomation ? DEFAULT_REQUESTS_PER_HOUR : 0,
     remoteBrowserHours: 0,
   };
+  */
 }
 
 /**
