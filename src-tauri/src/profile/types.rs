@@ -1,3 +1,4 @@
+use crate::fingerprint_chromium::FingerprintChromiumConfig;
 use crate::wayfern_manager::WayfernConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,8 @@ pub struct BrowserProfile {
   pub release_type: String,
   #[serde(default)]
   pub wayfern_config: Option<WayfernConfig>, // Wayfern configuration
+  #[serde(default)]
+  pub fingerprint_chromium_config: Option<FingerprintChromiumConfig>,
   #[serde(default)]
   pub group_id: Option<String>, // Reference to profile group
   #[serde(default)]
@@ -112,6 +115,12 @@ impl BrowserProfile {
     self
       .host_os
       .as_deref()
+      .or_else(|| {
+        self
+          .fingerprint_chromium_config
+          .as_ref()
+          .map(|config| config.platform.as_str())
+      })
       .or_else(|| self.wayfern_config.as_ref().and_then(|c| c.os.as_deref()))
   }
 

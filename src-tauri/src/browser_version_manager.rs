@@ -25,6 +25,7 @@ pub struct DownloadInfo {
   pub url: String,
   pub filename: String,
   pub is_archive: bool, // true for .dmg, .zip, etc.
+  pub expected_sha256: Option<String>,
 }
 
 pub struct BrowserVersionManager {
@@ -50,6 +51,10 @@ impl BrowserVersionManager {
     let (os, arch) = Self::get_platform_info();
 
     match browser {
+      crate::fingerprint_chromium::BROWSER_ID => Ok(matches!(
+        (os.as_str(), arch.as_str()),
+        ("windows", "x64") | ("linux", "x64")
+      )),
       "wayfern" => {
         let platform_key = format!("{os}-{arch}");
         Ok(matches!(
@@ -68,7 +73,7 @@ impl BrowserVersionManager {
 
   /// Get list of browsers supported on the current platform
   pub fn get_supported_browsers(&self) -> Vec<String> {
-    let all_browsers = vec!["wayfern"];
+    let all_browsers = vec![crate::fingerprint_chromium::BROWSER_ID, "wayfern"];
 
     all_browsers
       .into_iter()
@@ -114,8 +119,15 @@ impl BrowserVersionManager {
     &self,
     browser: &str,
   ) -> Result<BrowserReleaseTypes, Box<dyn std::error::Error + Send + Sync>> {
-    if browser != "wayfern" {
+    if !matches!(browser, "wayfern" | crate::fingerprint_chromium::BROWSER_ID) {
       return Err(format!("Unsupported browser: {browser}").into());
+    }
+    if browser == crate::fingerprint_chromium::BROWSER_ID {
+      return Ok(BrowserReleaseTypes {
+        stable: self
+          .is_browser_supported(browser)?
+          .then(|| crate::fingerprint_chromium::PINNED_VERSION.to_string()),
+      });
     }
 
     if let Some(cached_versions) = self.get_cached_browser_versions_detailed(browser) {
@@ -158,6 +170,13 @@ impl BrowserVersionManager {
 
     // Fetch fresh versions from API
     let fresh_versions = match browser {
+      crate::fingerprint_chromium::BROWSER_ID => {
+        if self.is_browser_supported(browser)? {
+          vec![crate::fingerprint_chromium::PINNED_VERSION.to_string()]
+        } else {
+          Vec::new()
+        }
+      }
       "wayfern" => self.fetch_wayfern_versions(true).await?,
       _ => return Err(format!("Unsupported browser: {browser}").into()),
     };
@@ -173,7 +192,11 @@ impl BrowserVersionManager {
     };
 
     // Merge existing and fresh versions
-    let mut merged_versions: Vec<String> = existing_set.union(&fresh_set).cloned().collect();
+    let mut merged_versions: Vec<String> = if browser == crate::fingerprint_chromium::BROWSER_ID {
+      fresh_set.iter().cloned().collect()
+    } else {
+      existing_set.union(&fresh_set).cloned().collect()
+    };
 
     // Sort versions using the existing sorting logic
     crate::api_client::sort_versions(&mut merged_versions);
@@ -221,7 +244,7 @@ impl BrowserVersionManager {
     // Since we don't have detailed date/prerelease info for cached versions,
     // we'll fetch fresh detailed info and map it to our merged versions
     let detailed_info: Vec<BrowserVersionInfo> = match browser {
-      "wayfern" => merged_versions
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID => merged_versions
         .into_iter()
         .map(|version| BrowserVersionInfo {
           version: version.clone(),
@@ -255,7 +278,11 @@ impl BrowserVersionManager {
     let new_versions_count = really_new_versions.len();
 
     // Merge existing and new versions
-    let mut all_versions: Vec<String> = existing_set.union(&new_set).cloned().collect();
+    let mut all_versions: Vec<String> = if browser == crate::fingerprint_chromium::BROWSER_ID {
+      new_set.iter().cloned().collect()
+    } else {
+      existing_set.union(&new_set).cloned().collect()
+    };
 
     // Sort versions using the existing sorting logic
     sort_versions(&mut all_versions);
@@ -284,6 +311,55 @@ impl BrowserVersionManager {
     let (os, arch) = Self::get_platform_info();
 
     match browser {
+      crate::fingerprint_chromium::BROWSER_ID => {
+        if version != crate::fingerprint_chromium::PINNED_VERSION {
+          return Err(
+            format!("fingerprint-chromium version {version} is not pinned for this build").into(),
+          );
+        }
+        let (filename, url) = match (os.as_str(), arch.as_str()) {
+          ("windows", "x64") => {
+            let filename = format!("ungoogled-chromium_{version}-1.1_windows_x64.zip");
+            (
+              filename.clone(),
+              format!(
+                "https://github.com/adryfish/fingerprint-chromium/releases/download/{version}/{filename}"
+              ),
+            )
+          }
+          ("linux", "x64") => {
+            let filename = format!("ungoogled-chromium-{version}-1-x86_64_linux.tar.xz");
+            (
+              filename.clone(),
+              format!(
+                "https://github.com/adryfish/fingerprint-chromium/releases/download/{version}/{filename}"
+              ),
+            )
+          }
+          _ => {
+            return Err(
+              format!("fingerprint-chromium {version} is not available for {os}/{arch}").into(),
+            )
+          }
+        };
+        Ok(DownloadInfo {
+          url,
+          filename,
+          is_archive: true,
+          expected_sha256: Some(
+            match (os.as_str(), arch.as_str()) {
+              ("windows", "x64") => {
+                "ab409667ca7ec3d67a060f1ffea8bd3a450b71ed54d17b361024986e7edd0996"
+              }
+              ("linux", "x64") => {
+                "bb4c44840bae7e881f6258ed5b33f972f284384d898b6289e1f0c0bf47555ede"
+              }
+              _ => unreachable!("unsupported fingerprint-chromium platform"),
+            }
+            .to_string(),
+          ),
+        })
+      }
       "wayfern" => {
         // Wayfern downloads from https://download.wayfern.com/
         // File naming: wayfern-{chromium_version}-{platform}-{arch}.{ext}
@@ -307,6 +383,7 @@ impl BrowserVersionManager {
           url: format!("https://download.wayfern.com/{filename}"),
           filename,
           is_archive,
+          expected_sha256: None,
         })
       }
       _ => Err(format!("Unsupported browser: {browser}").into()),
@@ -439,6 +516,49 @@ mod tests {
     }
 
     assert!(wayfern_info.url.contains("download.wayfern.com"));
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+      let fingerprint_info = service
+        .get_download_info(
+          crate::fingerprint_chromium::BROWSER_ID,
+          crate::fingerprint_chromium::PINNED_VERSION,
+        )
+        .unwrap();
+      assert_eq!(
+        fingerprint_info.filename,
+        "ungoogled-chromium_144.0.7559.132-1.1_windows_x64.zip"
+      );
+      assert!(fingerprint_info
+        .url
+        .contains("adryfish/fingerprint-chromium/releases/download/144.0.7559.132"));
+      assert_eq!(
+        fingerprint_info.expected_sha256.as_deref(),
+        Some("ab409667ca7ec3d67a060f1ffea8bd3a450b71ed54d17b361024986e7edd0996")
+      );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+      let fingerprint_info = service
+        .get_download_info(
+          crate::fingerprint_chromium::BROWSER_ID,
+          crate::fingerprint_chromium::PINNED_VERSION,
+        )
+        .unwrap();
+      assert_eq!(
+        fingerprint_info.filename,
+        "ungoogled-chromium-144.0.7559.132-1-x86_64_linux.tar.xz"
+      );
+      assert_eq!(
+        fingerprint_info.expected_sha256.as_deref(),
+        Some("bb4c44840bae7e881f6258ed5b33f972f284384d898b6289e1f0c0bf47555ede")
+      );
+    }
+
+    assert!(service
+      .get_download_info(crate::fingerprint_chromium::BROWSER_ID, "999.0.0.0")
+      .is_err());
 
     let unsupported_result = service.get_download_info("firefox", "1.0.0");
     assert!(unsupported_result.is_err());

@@ -870,7 +870,10 @@ impl ExtensionManager {
       return Ok(Vec::new());
     }
 
-    if profile.browser.as_str() != "wayfern" {
+    if !matches!(
+      profile.browser.as_str(),
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+    ) {
       return Ok(Vec::new());
     }
 

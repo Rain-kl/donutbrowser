@@ -55,9 +55,8 @@ pub struct ApiProfileResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateProfileRequest {
   pub name: String,
-  /// Browser engine. Must be `"wayfern"` (anti-detect Chromium)
-  /// (anti-detect Firefox). Any other value (e.g. `"chromium"`) is rejected with
-  /// 400.
+  /// Browser engine. Defaults to `"fingerprint_chromium"`.
+  #[serde(default = "default_profile_browser")]
   pub browser: String,
   /// Optional. Omit (or pass `"latest"`) to use the newest already-downloaded
   /// version of the chosen browser. A concrete version must already be
@@ -81,6 +80,10 @@ pub struct CreateProfileRequest {
   pub wayfern_config: Option<serde_json::Value>,
   pub group_id: Option<String>,
   pub tags: Option<Vec<String>>,
+}
+
+fn default_profile_browser() -> String {
+  crate::fingerprint_chromium::DEFAULT_BROWSER.to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -778,8 +781,8 @@ async fn get_profile(
 
 /// Create a profile.
 ///
-/// - `browser` must be `"wayfern"`; any other value is rejected
-///   with 400.
+/// - `browser` defaults to `"fingerprint_chromium"`; `"wayfern"` remains
+///   available for compatibility.
 /// - `version` is optional: omit it or pass `"latest"` to use the newest
 ///   already-downloaded version of that browser. The version must be present
 ///   locally (this endpoint does not download new versions); 400 if none is.
@@ -812,11 +815,14 @@ async fn create_profile(
   // else up front — otherwise the profile is created with no fingerprint and an
   // unrecognized browser, then crashes with a 500 on /run. Mirrors the MCP
   // create_profile validation.
-  if request.browser != "wayfern" {
+  if !matches!(
+    request.browser.as_str(),
+    "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+  ) {
     return Err((
       StatusCode::BAD_REQUEST,
       format!(
-        "Invalid browser \"{}\". Must be \"wayfern\" (anti-detect Chromium).",
+        "Invalid browser \"{}\". Must be \"fingerprint_chromium\" or \"wayfern\".",
         request.browser
       ),
     ));
@@ -2397,13 +2403,10 @@ mod tests {
 
   #[test]
   fn create_profile_request_allows_omitting_version_and_configs() {
-    // Minimal body: no version, no wayfern_config. Must
-    // deserialize (version resolves to latest-downloaded at the handler; an
-    // absent config triggers fresh-fingerprint generation).
-    let json = r#"{"name": "p", "browser": "wayfern"}"#;
+    let json = r#"{"name": "p"}"#;
     let parsed: CreateProfileRequest =
       serde_json::from_str(json).expect("version and configs are optional");
-    assert_eq!(parsed.browser, "wayfern");
+    assert_eq!(parsed.browser, crate::fingerprint_chromium::DEFAULT_BROWSER);
     assert!(parsed.version.is_none());
     assert!(parsed.wayfern_config.is_none());
   }
@@ -2412,8 +2415,9 @@ mod tests {
   fn create_profile_browser_validation_matches_supported_engines() {
     // The handler rejects anything that isn't a launchable engine; this is the
     // same predicate it uses, kept in lockstep with MCP's create_profile.
-    let is_valid = |b: &str| b == "wayfern";
+    let is_valid = |b: &str| matches!(b, "wayfern" | crate::fingerprint_chromium::BROWSER_ID);
     assert!(is_valid("wayfern"));
+    assert!(is_valid(crate::fingerprint_chromium::BROWSER_ID));
     assert!(!is_valid("chromium"));
     assert!(!is_valid("firefox"));
     assert!(!is_valid(""));

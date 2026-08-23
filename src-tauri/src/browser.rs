@@ -13,18 +13,21 @@ pub struct ProxySettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BrowserType {
+  FingerprintChromium,
   Wayfern,
 }
 
 impl BrowserType {
   pub fn as_str(&self) -> &'static str {
     match self {
+      BrowserType::FingerprintChromium => crate::fingerprint_chromium::BROWSER_ID,
       BrowserType::Wayfern => "wayfern",
     }
   }
 
   pub fn from_str(s: &str) -> Result<Self, String> {
     match s {
+      crate::fingerprint_chromium::BROWSER_ID => Ok(BrowserType::FingerprintChromium),
       "wayfern" => Ok(BrowserType::Wayfern),
       _ => Err(format!("Unknown browser type: {s}")),
     }
@@ -44,6 +47,79 @@ pub trait Browser: Send + Sync {
   ) -> Result<Vec<String>, Box<dyn std::error::Error>>;
   fn is_version_downloaded(&self, version: &str, binaries_dir: &Path) -> bool;
   fn prepare_executable(&self, executable_path: &Path) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+fn find_file_recursive(
+  directory: &Path,
+  remaining_depth: usize,
+  predicate: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+  if remaining_depth == 0 {
+    return None;
+  }
+  let entries = std::fs::read_dir(directory).ok()?;
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.is_file() && predicate(&path) {
+      return Some(path);
+    }
+    if path.is_dir() {
+      if let Some(found) = find_file_recursive(&path, remaining_depth - 1, predicate) {
+        return Some(found);
+      }
+    }
+  }
+  None
+}
+
+fn get_fingerprint_chromium_executable_path(
+  install_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+  #[cfg(target_os = "windows")]
+  {
+    find_file_recursive(install_dir, 5, &|path| {
+      let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+      matches!(name.as_str(), "chrome.exe" | "chromium.exe") && is_pe_executable(path)
+    })
+    .ok_or_else(|| "fingerprint-chromium executable not found".into())
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    return find_file_recursive(install_dir, 5, &|path| {
+      let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+      matches!(name.as_str(), "chrome" | "chromium")
+    })
+    .ok_or_else(|| "fingerprint-chromium executable not found".into());
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    return find_file_recursive(install_dir, 6, &|path| {
+      let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+      path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|parent| parent == "MacOS")
+        && matches!(name.as_str(), "chromium" | "chrome")
+    })
+    .ok_or_else(|| "fingerprint-chromium executable not found".into());
+  }
+
+  #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+  Err("Unsupported platform".into())
 }
 
 // Platform-specific modules
@@ -262,6 +338,58 @@ impl WayfernBrowser {
   }
 }
 
+pub struct FingerprintChromiumBrowser;
+
+impl FingerprintChromiumBrowser {
+  pub fn new() -> Self {
+    Self
+  }
+}
+
+impl Browser for FingerprintChromiumBrowser {
+  fn get_executable_path(&self, install_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    get_fingerprint_chromium_executable_path(install_dir)
+  }
+
+  fn create_launch_args(
+    &self,
+    profile_path: &str,
+    proxy_settings: Option<&ProxySettings>,
+    url: Option<String>,
+    remote_debugging_port: Option<u16>,
+    headless: bool,
+  ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    WayfernBrowser::new().create_launch_args(
+      profile_path,
+      proxy_settings,
+      url,
+      remote_debugging_port,
+      headless,
+    )
+  }
+
+  fn is_version_downloaded(&self, version: &str, binaries_dir: &Path) -> bool {
+    let install_dir = binaries_dir
+      .join(crate::fingerprint_chromium::BROWSER_ID)
+      .join(version);
+    get_fingerprint_chromium_executable_path(&install_dir).is_ok()
+  }
+
+  fn prepare_executable(&self, executable_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    return linux::prepare_executable(executable_path);
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+      let _ = executable_path;
+      Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    Err("Unsupported platform".into())
+  }
+}
+
 impl Browser for WayfernBrowser {
   fn get_executable_path(&self, install_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
@@ -373,6 +501,7 @@ impl BrowserFactory {
 
   pub fn create_browser(&self, browser_type: BrowserType) -> Box<dyn Browser> {
     match browser_type {
+      BrowserType::FingerprintChromium => Box::new(FingerprintChromiumBrowser::new()),
       BrowserType::Wayfern => Box::new(WayfernBrowser::new()),
     }
   }
@@ -627,6 +756,7 @@ mod tests {
       last_launch: None,
       release_type: "stable".to_string(),
       wayfern_config: None,
+      fingerprint_chromium_config: None,
       group_id: None,
       tags: Vec::new(),
       note: None,

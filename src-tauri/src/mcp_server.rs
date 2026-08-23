@@ -23,7 +23,6 @@ use crate::group_manager::GROUP_MANAGER;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::settings_manager::SettingsManager;
-use crate::wayfern_terms::WayfernTermsManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +106,10 @@ pub struct McpError {
 
 const DEFAULT_MCP_PORT: u16 = 51080;
 
+fn is_mcp_browser(browser: &str) -> bool {
+  matches!(browser, "wayfern" | crate::fingerprint_chromium::BROWSER_ID)
+}
+
 struct McpSession {
   initialized: bool,
 }
@@ -183,12 +186,6 @@ impl McpServer {
   }
 
   pub async fn start(&self, app_handle: AppHandle) -> Result<u16, String> {
-    if !WayfernTermsManager::instance().is_terms_accepted() {
-      return Err(
-        "Wayfern Terms and Conditions must be accepted before starting MCP server".to_string(),
-      );
-    }
-
     if self.is_running() {
       return Err("MCP server is already running".to_string());
     }
@@ -507,7 +504,7 @@ impl McpServer {
     vec![
       McpTool {
         name: "list_profiles".to_string(),
-        description: "List all Wayfern browser profiles".to_string(),
+        description: "List all supported browser profiles".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {},
@@ -548,6 +545,24 @@ impl McpServer {
             }
           },
           "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "unlock_profile".to_string(),
+        description: "Unlock a password-protected browser profile for the current app session. Requires browser automation access.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile to unlock"
+            },
+            "password": {
+              "type": "string",
+              "description": "The profile password"
+            }
+          },
+          "required": ["profile_id", "password"]
         }),
       },
       McpTool {
@@ -614,8 +629,9 @@ impl McpServer {
             },
             "browser": {
               "type": "string",
-              "enum": ["wayfern"],
-              "description": "Browser engine to use"
+              "enum": ["fingerprint_chromium", "wayfern"],
+              "default": "fingerprint_chromium",
+              "description": "Browser engine to use; defaults to fingerprint_chromium"
             },
             "proxy_id": {
               "type": "string",
@@ -635,7 +651,7 @@ impl McpServer {
               "description": "Optional tags for the profile"
             }
           },
-          "required": ["name", "browser"]
+          "required": ["name"]
         }),
       },
       McpTool {
@@ -677,6 +693,24 @@ impl McpServer {
               "type": "array",
               "items": { "type": "string" },
               "description": "Proxy bypass rules (replaces existing rules)"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "migrate_profile_to_fingerprint_chromium".to_string(),
+        description: "Migrate a stopped Wayfern profile to Fingerprint Chromium while preserving its browser data and assignments".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the stopped Wayfern profile to migrate"
+            },
+            "password": {
+              "type": "string",
+              "description": "Profile password; required when migrating a password-protected profile's browser data"
             }
           },
           "required": ["profile_id"]
@@ -1049,7 +1083,7 @@ impl McpServer {
       // Fingerprint management tools
       McpTool {
         name: "get_profile_fingerprint".to_string(),
-        description: "Get the fingerprint configuration for a Wayfern profile"
+        description: "Get the fingerprint configuration for a supported profile"
           .to_string(),
         input_schema: serde_json::json!({
           "type": "object",
@@ -1706,6 +1740,14 @@ impl McpServer {
         .await?;
         self.handle_run_profile(arguments).await
       }
+      "unlock_profile" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_unlock_profile(arguments).await
+      }
       "kill_profile" => {
         Self::require_capability(
           "Browser automation",
@@ -1732,6 +1774,11 @@ impl McpServer {
       }
       "create_profile" => self.handle_create_profile(arguments).await,
       "update_profile" => self.handle_update_profile(arguments).await,
+      "migrate_profile_to_fingerprint_chromium" => {
+        self
+          .handle_migrate_profile_to_fingerprint_chromium(arguments)
+          .await
+      }
       "delete_profile" => self.handle_delete_profile(arguments).await,
       "list_tags" => self.handle_list_tags().await,
       "list_proxies" => self.handle_list_proxies().await,
@@ -1902,9 +1949,10 @@ impl McpServer {
         message: format!("Failed to list profiles: {e}"),
       })?;
 
-    // Filter to only Wayfern profiles
-    let filtered: Vec<&BrowserProfile> =
-      profiles.iter().filter(|p| p.browser == "wayfern").collect();
+    let filtered: Vec<&BrowserProfile> = profiles
+      .iter()
+      .filter(|profile| is_mcp_browser(&profile.browser))
+      .collect();
 
     Ok(serde_json::json!({
       "content": [{
@@ -1941,11 +1989,10 @@ impl McpServer {
         message: format!("Profile not found: {profile_id}"),
       })?;
 
-    // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!("MCP does not support browser '{}'", profile.browser),
       });
     }
 
@@ -1998,11 +2045,19 @@ impl McpServer {
         message: format!("Profile not found: {profile_id}"),
       })?;
 
-    // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!("MCP does not support browser '{}'", profile.browser),
+      });
+    }
+    if profile.browser == "wayfern"
+      && !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted()
+    {
+      return Err(McpError {
+        code: -32000,
+        message: "Wayfern Terms and Conditions must be accepted before launching Wayfern"
+          .to_string(),
       });
     }
 
@@ -2045,6 +2100,40 @@ impl McpServer {
     }))
   }
 
+  async fn handle_unlock_profile(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let password = arguments
+      .get("password")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing password".to_string(),
+      })?;
+
+    crate::profile::password::unlock_profile(profile_id.to_string(), password.to_string())
+      .await
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to unlock profile: {e}"),
+      })?;
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!("Browser profile '{profile_id}' unlocked successfully")
+      }]
+    }))
+  }
+
   async fn handle_kill_profile(
     &self,
     arguments: &serde_json::Value,
@@ -2080,11 +2169,10 @@ impl McpServer {
         message: format!("Profile not found: {profile_id}"),
       })?;
 
-    // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!("MCP does not support browser '{}'", profile.browser),
       });
     }
 
@@ -2171,9 +2259,18 @@ impl McpServer {
         lines.push(format!("{profile_id}: not found"));
         continue;
       };
-      if profile.browser != "wayfern" {
+      if !is_mcp_browser(&profile.browser) {
         lines.push(format!(
-          "{profile_id}: unsupported browser (MCP supports Wayfern)"
+          "{profile_id}: unsupported browser ({})",
+          profile.browser
+        ));
+        continue;
+      }
+      if profile.browser == "wayfern"
+        && !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted()
+      {
+        lines.push(format!(
+          "{profile_id}: Wayfern terms have not been accepted"
         ));
         continue;
       }
@@ -2291,15 +2388,12 @@ impl McpServer {
     let browser = arguments
       .get("browser")
       .and_then(|v| v.as_str())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing browser".to_string(),
-      })?;
+      .unwrap_or(crate::fingerprint_chromium::DEFAULT_BROWSER);
 
-    if browser != "wayfern" {
+    if !matches!(browser, "wayfern" | crate::fingerprint_chromium::BROWSER_ID) {
       return Err(McpError {
         code: -32602,
-        message: "browser must be 'wayfern'".to_string(),
+        message: "browser must be 'fingerprint_chromium' or 'wayfern'".to_string(),
       });
     }
 
@@ -2389,7 +2483,6 @@ impl McpServer {
         code: -32602,
         message: "Missing profile_id".to_string(),
       })?;
-
     let inner = self.inner.lock().await;
     let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
       code: -32000,
@@ -2509,7 +2602,6 @@ impl McpServer {
         code: -32602,
         message: "Missing profile_id".to_string(),
       })?;
-
     let inner = self.inner.lock().await;
     let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
       code: -32000,
@@ -2527,6 +2619,88 @@ impl McpServer {
       "content": [{
         "type": "text",
         "text": format!("Profile '{profile_id}' deleted successfully")
+      }]
+    }))
+  }
+
+  async fn handle_migrate_profile_to_fingerprint_chromium(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(|value| value.as_str())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing profile_id".to_string(),
+      })?;
+    let password = arguments.get("password").and_then(|value| value.as_str());
+
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
+      code: -32000,
+      message: "MCP server not properly initialized".to_string(),
+    })?;
+    let profile = ProfileManager::instance()
+      .migrate_profile_to_fingerprint_chromium(app_handle.clone(), profile_id)
+      .await
+      .map_err(|error| McpError {
+        code: -32000,
+        message: format!("Failed to migrate profile: {error}"),
+      })?;
+
+    let data_migrated = if profile.password_protected {
+      let password = password.ok_or_else(|| McpError {
+        code: -32602,
+        message: "Password is required to migrate this profile's browser data".to_string(),
+      })?;
+      crate::profile::password::unlock_profile(profile_id.to_string(), password.to_string())
+        .await
+        .map_err(|error| McpError {
+          code: -32000,
+          message: format!("Failed to unlock profile for migration: {error}"),
+        })?;
+      let profile_path =
+        crate::profile::password::prepare_for_launch(&profile).map_err(|error| McpError {
+          code: -32000,
+          message: format!("Failed to prepare profile data for migration: {error}"),
+        })?;
+      match crate::fingerprint_chromium::migrate_wayfern_user_data(&profile_path) {
+        Ok(migrated) => {
+          crate::profile::password::complete_after_quit_and_wait(&profile)
+            .await
+            .ok_or_else(|| McpError {
+              code: -32000,
+              message: "Failed to re-encrypt migrated profile data".to_string(),
+            })?;
+          migrated
+        }
+        Err(error) => {
+          let _ = crate::profile::password::lock_profile(profile_id.to_string()).await;
+          return Err(McpError {
+            code: -32000,
+            message: format!("Failed to migrate profile browser data: {error}"),
+          });
+        }
+      }
+    } else {
+      let profile_path =
+        profile.get_profile_data_path(&ProfileManager::instance().get_profiles_dir());
+      crate::fingerprint_chromium::migrate_wayfern_user_data(&profile_path).map_err(|error| {
+        McpError {
+          code: -32000,
+          message: format!("Failed to migrate profile browser data: {error}"),
+        }
+      })?
+    };
+
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": serde_json::to_string_pretty(&serde_json::json!({
+          "profile": profile,
+          "browser_data_migrated": data_migrated
+        })).unwrap_or_else(|_| format!("Profile '{profile_id}' migrated successfully"))
       }]
     }))
   }
@@ -2591,11 +2765,10 @@ impl McpServer {
         message: format!("Profile not found: {profile_id}"),
       })?;
 
-    // Check if it's a Wayfern profile
-    if profile.browser != "wayfern" {
+    if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!("MCP does not support browser '{}'", profile.browser),
       });
     }
 
@@ -3517,10 +3690,19 @@ impl McpServer {
           "screen_min_height": config.screen_min_height,
         })
       }
+      crate::fingerprint_chromium::BROWSER_ID => serde_json::json!({
+        "browser": crate::fingerprint_chromium::BROWSER_ID,
+        "config": profile
+          .fingerprint_chromium_config
+          .clone()
+          .unwrap_or_else(|| {
+            crate::fingerprint_chromium::FingerprintChromiumConfig::for_profile(&profile.id)
+          }),
+      }),
       _ => {
         return Err(McpError {
           code: -32000,
-          message: "MCP only supports Wayfern profiles".to_string(),
+          message: format!("MCP does not support browser '{}'", profile.browser),
         })
       }
     };
@@ -3952,7 +4134,7 @@ impl McpServer {
 
   async fn get_cdp_port_for_profile(&self, profile: &BrowserProfile) -> Result<u16, McpError> {
     let profiles_dir = ProfileManager::instance().get_profiles_dir();
-    let profile_path = profile.get_profile_data_path(&profiles_dir);
+    let profile_path = crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
     let profile_path_str = profile_path.to_string_lossy();
 
     // Retry a few times — port info may not be stored yet right after launch
@@ -3960,7 +4142,7 @@ impl McpServer {
       if attempt > 0 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
       }
-      let port = if profile.browser == "wayfern" {
+      let port = if is_mcp_browser(&profile.browser) {
         crate::wayfern_manager::WayfernManager::instance()
           .get_cdp_port(&profile_path_str)
           .await
@@ -4362,10 +4544,10 @@ impl McpServer {
         message: format!("Profile not found: {profile_id}"),
       })?;
 
-    if profile.browser != "wayfern" {
+    if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: "MCP only supports Wayfern profiles".to_string(),
+        message: format!("MCP does not support browser '{}'", profile.browser),
       });
     }
 
@@ -5289,6 +5471,13 @@ mod tests {
   use super::*;
 
   #[test]
+  fn supports_both_chromium_profile_backends() {
+    assert!(is_mcp_browser("wayfern"));
+    assert!(is_mcp_browser(crate::fingerprint_chromium::BROWSER_ID));
+    assert!(!is_mcp_browser("firefox"));
+  }
+
+  #[test]
   fn test_mcp_tools_count() {
     let server = McpServer::new();
     let tools = server.get_tools();
@@ -5302,8 +5491,10 @@ mod tests {
     assert!(tool_names.contains(&"list_profiles"));
     assert!(tool_names.contains(&"get_profile"));
     assert!(tool_names.contains(&"run_profile"));
+    assert!(tool_names.contains(&"unlock_profile"));
     assert!(tool_names.contains(&"kill_profile"));
     assert!(tool_names.contains(&"get_profile_status"));
+    assert!(tool_names.contains(&"migrate_profile_to_fingerprint_chromium"));
     // Group tools
     assert!(tool_names.contains(&"list_groups"));
     assert!(tool_names.contains(&"get_group"));

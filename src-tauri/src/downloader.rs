@@ -15,6 +15,51 @@ use crate::events;
 // the UI can surface it and the caller can move on / retry.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+async fn verify_download_sha256(
+  path: &Path,
+  expected_sha256: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let Some(expected_sha256) = expected_sha256 else {
+    return Ok(());
+  };
+
+  let path = path.to_path_buf();
+  let expected_sha256 = expected_sha256.to_ascii_lowercase();
+  tokio::task::spawn_blocking(move || {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let file = std::fs::File::open(&path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+      let read = reader.read(&mut buffer)?;
+      if read == 0 {
+        break;
+      }
+      hasher.update(&buffer[..read]);
+    }
+
+    let actual: String = hasher
+      .finalize()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    if actual != expected_sha256 {
+      return Err(
+        format!(
+          "SHA-256 mismatch for {}: expected {expected_sha256}, got {actual}",
+          path.display()
+        )
+        .into(),
+      );
+    }
+    Ok(())
+  })
+  .await?
+}
+
 // Global state to track currently downloading browser-version pairs
 lazy_static::lazy_static! {
   static ref DOWNLOADING_BROWSERS: std::sync::Arc<Mutex<std::collections::HashSet<String>>> =
@@ -121,9 +166,10 @@ impl Downloader {
     &self,
     browser_type: BrowserType,
     version: &str,
-    _download_info: &DownloadInfo,
+    download_info: &DownloadInfo,
   ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     match browser_type {
+      BrowserType::FingerprintChromium => Ok(download_info.url.clone()),
       BrowserType::Wayfern => {
         // For Wayfern, get the download URL from version.json
         let version_info = self
@@ -500,7 +546,10 @@ impl Downloader {
   ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Only check Wayfern terms if Wayfern is already downloaded
     let terms_manager = crate::wayfern_terms::WayfernTermsManager::instance();
-    if terms_manager.is_wayfern_downloaded() && !terms_manager.is_terms_accepted() {
+    if browser_str == "wayfern"
+      && terms_manager.is_wayfern_downloaded()
+      && !terms_manager.is_terms_accepted()
+    {
       return Err("Please accept Wayfern Terms and Conditions before downloading browsers".into());
     }
 
@@ -659,6 +708,34 @@ impl Downloader {
         return Err(format!("Failed to download browser: {e}").into());
       }
     };
+
+    if let Err(error) =
+      verify_download_sha256(&download_path, download_info.expected_sha256.as_deref()).await
+    {
+      log::error!("Browser archive verification failed: {error}");
+      let _ = std::fs::remove_file(&download_path);
+      let _ = self.registry.remove_browser(&browser_str, &version);
+      let _ = self.registry.save();
+      DOWNLOADING_BROWSERS.lock().unwrap().remove(&download_key);
+      DOWNLOAD_CANCELLATION_TOKENS
+        .lock()
+        .unwrap()
+        .remove(&download_key);
+      let _ = events::emit(
+        "download-progress",
+        &DownloadProgress {
+          browser: browser_str,
+          version,
+          downloaded_bytes: 0,
+          total_bytes: None,
+          percentage: 0.0,
+          speed_bytes_per_sec: 0.0,
+          eta_seconds: None,
+          stage: "error".to_string(),
+        },
+      );
+      return Err(format!("Failed to verify browser archive: {error}").into());
+    }
 
     // Use the extraction module
     if download_info.is_archive {
@@ -937,6 +1014,23 @@ mod tests {
   use tempfile::TempDir;
   use wiremock::matchers::{method, path};
   use wiremock::{Mock, MockServer, ResponseTemplate};
+
+  #[tokio::test]
+  async fn verifies_expected_download_sha256() {
+    let temp_dir = TempDir::new().unwrap();
+    let archive = temp_dir.path().join("archive.zip");
+    std::fs::write(&archive, b"abc").unwrap();
+
+    assert!(verify_download_sha256(
+      &archive,
+      Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    )
+    .await
+    .is_ok());
+    assert!(verify_download_sha256(&archive, Some("0000"))
+      .await
+      .is_err());
+  }
 
   #[tokio::test]
   async fn test_download_file_with_progress() {

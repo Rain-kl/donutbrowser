@@ -130,7 +130,7 @@ impl ProfileManager {
 
     // For Wayfern profiles, generate fingerprint during creation
     let final_wayfern_config = if browser == "wayfern" {
-      let mut config = wayfern_config.unwrap_or_else(|| {
+      let mut config = wayfern_config.clone().unwrap_or_else(|| {
         log::info!("Creating default Wayfern config for profile: {name}");
         crate::wayfern_manager::WayfernConfig::default()
       });
@@ -185,6 +185,7 @@ impl ProfileManager {
           last_launch: None,
           release_type: release_type.to_string(),
           wayfern_config: None,
+          fingerprint_chromium_config: None,
           group_id: group_id.clone(),
           tags: Vec::new(),
           note: None,
@@ -241,7 +242,21 @@ impl ProfileManager {
 
       Some(config)
     } else {
-      wayfern_config.clone()
+      None
+    };
+
+    let final_fingerprint_chromium_config = if browser == crate::fingerprint_chromium::BROWSER_ID {
+      let mut config =
+        crate::fingerprint_chromium::FingerprintChromiumConfig::for_profile(&profile_id);
+      if let Some(shared) = wayfern_config.as_ref() {
+        config.geoip = shared.geoip.clone();
+        config.block_images = shared.block_images;
+        config.block_webgl = shared.block_webgl;
+        config.disable_non_proxied_udp = shared.block_webrtc.unwrap_or(true);
+      }
+      Some(config)
+    } else {
+      None
     };
 
     let profile = BrowserProfile {
@@ -256,6 +271,7 @@ impl ProfileManager {
       last_launch: None,
       release_type: release_type.to_string(),
       wayfern_config: final_wayfern_config,
+      fingerprint_chromium_config: final_fingerprint_chromium_config,
       group_id: group_id.clone(),
       tags: Vec::new(),
       note: None,
@@ -317,6 +333,115 @@ impl ProfileManager {
     });
 
     Ok(())
+  }
+
+  pub async fn migrate_profile_to_fingerprint_chromium(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile_id: &str,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    let profile_uuid = uuid::Uuid::parse_str(profile_id).map_err(
+      |_| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Invalid profile ID: {profile_id}").into()
+      },
+    )?;
+    let profiles =
+      self
+        .list_profiles()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+          format!("Failed to list profiles: {e}").into()
+        })?;
+    let mut profile = profiles
+      .into_iter()
+      .find(|profile| profile.id == profile_uuid)
+      .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Profile with ID '{profile_id}' not found").into()
+      })?;
+
+    if profile.browser == crate::fingerprint_chromium::BROWSER_ID {
+      return Ok(profile);
+    }
+    if profile.browser != "wayfern" {
+      return Err(
+        format!(
+          "Profile browser '{}' cannot be migrated to Fingerprint Chromium",
+          profile.browser
+        )
+        .into(),
+      );
+    }
+    if self.check_browser_status(app_handle, &profile).await? {
+      return Err("Cannot migrate a running profile; stop it first".into());
+    }
+
+    let mut config =
+      crate::fingerprint_chromium::FingerprintChromiumConfig::for_profile(&profile.id);
+    if let Some(wayfern) = profile.wayfern_config.as_ref() {
+      config.platform = wayfern.os.clone().unwrap_or_else(get_host_os);
+      config.geoip = wayfern.geoip.clone();
+      config.block_images = wayfern.block_images;
+      config.block_webgl = wayfern.block_webgl;
+      config.disable_non_proxied_udp = wayfern.block_webrtc.unwrap_or(true);
+
+      if let Some(fingerprint) = wayfern
+        .fingerprint
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+      {
+        config.timezone = fingerprint
+          .get("timezone")
+          .and_then(|value| value.as_str())
+          .map(str::to_string);
+        config.languages = fingerprint
+          .get("languages")
+          .and_then(|value| value.as_array())
+          .map(|values| {
+            values
+              .iter()
+              .filter_map(|value| value.as_str().map(str::to_string))
+              .collect()
+          })
+          .unwrap_or_default();
+        if config.languages.is_empty() {
+          if let Some(language) = fingerprint.get("language").and_then(|value| value.as_str()) {
+            config.languages.push(language.to_string());
+          }
+        }
+        config.hardware_concurrency = fingerprint
+          .get("hardwareConcurrency")
+          .and_then(|value| value.as_u64())
+          .and_then(|value| u8::try_from(value).ok())
+          .filter(|value| *value > 0);
+      }
+    }
+
+    profile.browser = crate::fingerprint_chromium::BROWSER_ID.to_string();
+    profile.version = crate::fingerprint_chromium::PINNED_VERSION.to_string();
+    profile.release_type = "stable".to_string();
+    profile.fingerprint_chromium_config = Some(config);
+    profile.process_id = None;
+    profile.updated_at = Some(crate::proxy_manager::now_secs());
+
+    self
+      .save_profile(&profile)
+      .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Failed to save migrated profile: {e}").into()
+      })?;
+    crate::sync::queue_profile_sync_if_eligible(&profile);
+
+    if let Err(e) = events::emit("profile-updated", &profile) {
+      log::warn!("Failed to emit migrated profile update: {e}");
+    }
+    if let Err(e) = events::emit_empty("profiles-changed") {
+      log::warn!("Failed to emit profiles-changed event: {e}");
+    }
+
+    log::info!(
+      "Migrated profile '{}' ({}) from Wayfern to Fingerprint Chromium",
+      profile.name,
+      profile.id
+    );
+    Ok(profile)
   }
 
   pub fn list_profiles(&self) -> Result<Vec<BrowserProfile>, Box<dyn std::error::Error>> {
@@ -949,6 +1074,12 @@ impl ProfileManager {
       fs::create_dir_all(&dest_dir)?;
     }
 
+    let fingerprint_chromium_config = source.fingerprint_chromium_config.map(|mut config| {
+      config.seed = crate::fingerprint_chromium::stable_seed(&new_id);
+      config.geo_proxy_signature = None;
+      config
+    });
+
     let mut new_profile = BrowserProfile {
       id: new_id,
       name: clone_name,
@@ -961,6 +1092,7 @@ impl ProfileManager {
       last_launch: None,
       release_type: source.release_type,
       wayfern_config: source.wayfern_config,
+      fingerprint_chromium_config,
       group_id: source.group_id,
       tags: source.tags,
       note: source.note,
@@ -1045,8 +1177,32 @@ impl ProfileManager {
       );
     }
 
-    // Update the Wayfern configuration
-    profile.wayfern_config = Some(config);
+    if profile.browser == crate::fingerprint_chromium::BROWSER_ID {
+      let mut fingerprint_config =
+        profile
+          .fingerprint_chromium_config
+          .clone()
+          .unwrap_or_else(|| {
+            crate::fingerprint_chromium::FingerprintChromiumConfig::for_profile(&profile.id)
+          });
+      fingerprint_config.platform = get_host_os();
+      fingerprint_config.geoip = config.geoip;
+      fingerprint_config.block_images = config.block_images;
+      fingerprint_config.block_webgl = config.block_webgl;
+      fingerprint_config.disable_non_proxied_udp = config.block_webrtc.unwrap_or(true);
+      fingerprint_config.geo_proxy_signature = None;
+      profile.fingerprint_chromium_config = Some(fingerprint_config);
+    } else if profile.browser == "wayfern" {
+      profile.wayfern_config = Some(config);
+    } else {
+      return Err(
+        format!(
+          "Browser '{}' does not support fingerprint configuration",
+          profile.browser
+        )
+        .into(),
+      );
+    }
 
     // Save the updated profile
     self
@@ -1058,7 +1214,7 @@ impl ProfileManager {
     crate::sync::queue_profile_sync_if_eligible(&profile);
 
     log::info!(
-      "Wayfern configuration updated for profile '{}' (ID: {}).",
+      "Fingerprint configuration updated for profile '{}' (ID: {}).",
       profile.name,
       profile_id
     );
@@ -1245,7 +1401,10 @@ impl ProfileManager {
     profile: &BrowserProfile,
   ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Handle Wayfern profiles using WayfernManager-based status checking
-    if profile.browser == "wayfern" {
+    if matches!(
+      profile.browser.as_str(),
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+    ) {
       return self.check_wayfern_status(&app_handle, profile).await;
     }
 
@@ -1287,7 +1446,7 @@ impl ProfileManager {
           // Check if this is the right browser executable first
           let exe_name = process.name().to_string_lossy().to_lowercase();
           let is_correct_browser = match profile.browser.as_str() {
-            "wayfern" => {
+            "wayfern" | crate::fingerprint_chromium::BROWSER_ID => {
               exe_name.contains("wayfern")
                 || exe_name.contains("chromium")
                 || exe_name.contains("chrome")

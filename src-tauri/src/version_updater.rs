@@ -256,7 +256,7 @@ impl VersionUpdater {
 
     // Only fetch versions for active browsers (wayfern) plus any
     // deprecated browsers that still have existing profiles
-    let active_browsers = ["wayfern"];
+    let active_browsers = [crate::fingerprint_chromium::DEFAULT_BROWSER];
     let browsers_with_profiles: std::collections::HashSet<String> =
       crate::profile::ProfileManager::instance()
         .list_profiles()

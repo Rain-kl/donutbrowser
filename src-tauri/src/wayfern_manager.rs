@@ -603,6 +603,193 @@ impl WayfernManager {
   }
 
   #[allow(clippy::too_many_arguments)]
+  pub async fn launch_fingerprint_chromium(
+    &self,
+    profile: &BrowserProfile,
+    profile_path: &str,
+    config: &crate::fingerprint_chromium::FingerprintChromiumConfig,
+    url: Option<&str>,
+    proxy_url: Option<&str>,
+    ephemeral: bool,
+    extension_paths: &[String],
+    remote_debugging_port: Option<u16>,
+    headless: bool,
+  ) -> Result<WayfernLaunchResult, Box<dyn std::error::Error + Send + Sync>> {
+    let executable_path = BrowserRunner::instance()
+      .get_browser_executable_path(profile)
+      .map_err(|e| format!("Failed to get fingerprint-chromium executable path: {e}"))?;
+    let port = match remote_debugging_port {
+      Some(port) => port,
+      None => Self::find_free_port().await?,
+    };
+
+    let mut args = vec![
+      format!("--remote-debugging-port={port}"),
+      "--remote-debugging-address=127.0.0.1".to_string(),
+      format!("--user-data-dir={profile_path}"),
+      "--no-first-run".to_string(),
+      "--no-default-browser-check".to_string(),
+      "--disable-background-mode".to_string(),
+      "--disable-component-update".to_string(),
+      "--disable-background-timer-throttling".to_string(),
+      "--crash-server-url=".to_string(),
+      "--disable-updater".to_string(),
+      "--disable-session-crashed-bubble".to_string(),
+      "--hide-crash-restore-bubble".to_string(),
+      "--disable-infobars".to_string(),
+      "--disable-features=DialMediaRouteProvider,DnsOverHttps,AsyncDns,Prefetch,PrefetchProxy,SpeculationRulesPrefetchFuture,NoStatePrefetch".to_string(),
+      "--use-mock-keychain".to_string(),
+      "--password-store=basic".to_string(),
+    ];
+    args.extend(config.launch_args());
+
+    if headless {
+      args.push("--headless=new".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+      args.push("--no-sandbox".to_string());
+      args.push("--disable-setuid-sandbox".to_string());
+      args.push("--disable-dev-shm-usage".to_string());
+    }
+
+    if ephemeral {
+      args.push("--disk-cache-size=1".to_string());
+      args.push("--disable-breakpad".to_string());
+      args.push("--disable-crash-reporter".to_string());
+      args.push("--no-service-autorun".to_string());
+      args.push("--disable-sync".to_string());
+    }
+    if !extension_paths.is_empty() {
+      args.push(format!("--load-extension={}", extension_paths.join(",")));
+    }
+    if let Some(proxy) = proxy_url {
+      let (pac_directive, host_port) = if let Some(rest) = proxy.strip_prefix("socks5://") {
+        ("SOCKS5", rest)
+      } else {
+        (
+          "PROXY",
+          proxy
+            .trim_start_matches("http://")
+            .trim_start_matches("https://"),
+        )
+      };
+      let pac_data = format!(
+        "data:application/x-ns-proxy-autoconfig,function FindProxyForURL(url,host){{return \"{pac_directive} {host_port}\";}}",
+      );
+      args.push(format!("--proxy-pac-url={pac_data}"));
+      args.push("--dns-prefetch-disable".to_string());
+    }
+
+    log::info!(
+      "Launching fingerprint-chromium for profile {} on CDP port {port}",
+      profile.name
+    );
+    let stderr_path = std::env::temp_dir().join(format!("fingerprint-chromium-{}.log", profile.id));
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(
+      |error| -> Box<dyn std::error::Error + Send + Sync> {
+        format!(
+          "Failed to create fingerprint-chromium log {}: {error}",
+          stderr_path.display()
+        )
+        .into()
+      },
+    )?;
+    let mut command = TokioCommand::new(&executable_path);
+    command
+      .args(&args)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::from(stderr_file));
+    let mut child =
+      command
+        .spawn()
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+          let hint = if error.raw_os_error() == Some(14001) {
+            ". Install the Visual C++ Redistributable from \
+           https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          } else {
+            ""
+          };
+          format!("Failed to spawn fingerprint-chromium: {error}{hint}").into()
+        })?;
+    let process_id = child.id();
+
+    tokio::select! {
+      result = self.wait_for_cdp_ready(port) => result?,
+      status = child.wait() => {
+        let status = status.map_err(
+          |error| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Failed while waiting for fingerprint-chromium: {error}").into()
+          },
+        )?;
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let detail = stderr
+          .lines()
+          .rev()
+          .take(20)
+          .collect::<Vec<_>>()
+          .into_iter()
+          .rev()
+          .collect::<Vec<_>>()
+          .join("\n");
+        return Err(format!(
+          "fingerprint-chromium exited before CDP became ready ({status}). Log: {}{}",
+          stderr_path.display(),
+          if detail.is_empty() {
+            String::new()
+          } else {
+            format!("\n{detail}")
+          }
+        )
+        .into());
+      }
+    }
+    drop(child);
+    let targets = self.get_cdp_targets(port).await?;
+    let page_targets: Vec<_> = targets
+      .iter()
+      .filter(|target| target.target_type == "page")
+      .collect();
+
+    if let Some(url) = url {
+      if let Some(ws_url) = page_targets
+        .first()
+        .and_then(|target| target.websocket_debugger_url.as_deref())
+      {
+        self
+          .send_cdp_command(ws_url, "Page.navigate", json!({ "url": url }))
+          .await?;
+      }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let instance = WayfernInstance {
+      id: id.clone(),
+      process_id,
+      profile_path: Some(profile_path.to_string()),
+      url: url.map(str::to_string),
+      cdp_port: Some(port),
+    };
+    self
+      .inner
+      .lock()
+      .await
+      .instances
+      .insert(id.clone(), instance);
+
+    Ok(WayfernLaunchResult {
+      id,
+      processId: process_id,
+      profilePath: Some(profile_path.to_string()),
+      url: url.map(str::to_string),
+      cdp_port: Some(port),
+      used_fingerprint: None,
+    })
+  }
+
+  #[allow(clippy::too_many_arguments)]
   pub async fn launch_wayfern(
     &self,
     _app_handle: &AppHandle,
@@ -625,94 +812,6 @@ impl WayfernManager {
       None => Self::find_free_port().await?,
     };
     log::info!("Launching Wayfern on CDP port {port} (detached)");
-
-    // Diagnostic: verify critical profile files and test cookie decryption
-    {
-      let profile_path_buf = std::path::PathBuf::from(profile_path);
-      let key_path = profile_path_buf.join("os_crypt_key");
-      let cookies_path = {
-        let network = profile_path_buf
-          .join("Default")
-          .join("Network")
-          .join("Cookies");
-        if network.exists() {
-          network
-        } else {
-          profile_path_buf.join("Default").join("Cookies")
-        }
-      };
-
-      if key_path.exists() {
-        let key_text = std::fs::read_to_string(&key_path).unwrap_or_default();
-        log::info!(
-          "Pre-launch: os_crypt_key present ({} bytes, content: '{}')",
-          key_text.len(),
-          key_text.trim()
-        );
-      } else {
-        log::warn!("Pre-launch: os_crypt_key NOT FOUND");
-      }
-
-      if cookies_path.exists() {
-        // Try to open Cookies DB and check if encrypted cookies can be decrypted
-        if let Ok(conn) = rusqlite::Connection::open_with_flags(
-          &cookies_path,
-          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
-          let cookie_count: i64 = conn
-            .query_row(
-              "SELECT COUNT(*) FROM cookies WHERE length(encrypted_value) > 0",
-              [],
-              |r| r.get(0),
-            )
-            .unwrap_or(0);
-          let total_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cookies", [], |r| r.get(0))
-            .unwrap_or(0);
-          log::info!(
-            "Pre-launch: Cookies DB has {} total cookies, {} encrypted",
-            total_count,
-            cookie_count
-          );
-
-          // Try decrypting one cookie using the cookie_manager
-          if let Some(encryption_key) =
-            crate::cookie_manager::chrome_decrypt::get_encryption_key(&profile_path_buf)
-          {
-            if let Ok(mut stmt) = conn.prepare(
-              "SELECT name, host_key, encrypted_value FROM cookies WHERE length(encrypted_value) > 0 LIMIT 1",
-            ) {
-              if let Ok(mut rows) = stmt.query([]) {
-                if let Ok(Some(row)) = rows.next() {
-                  let name: String = row.get(0).unwrap_or_default();
-                  let host: String = row.get(1).unwrap_or_default();
-                  let encrypted: Vec<u8> = row.get(2).unwrap_or_default();
-                  let decrypted = crate::cookie_manager::chrome_decrypt::decrypt(
-                    &encrypted,
-                    &host,
-                    &encryption_key,
-                  );
-                  match decrypted {
-                    Some(val) => log::info!(
-                      "Pre-launch: Cookie decryption SUCCEEDED for '{}' (host: {}, decrypted {} bytes)",
-                      name, host, val.len()
-                    ),
-                    None => log::error!(
-                      "Pre-launch: Cookie decryption FAILED for '{}' (host: {}, encrypted {} bytes)",
-                      name, host, encrypted.len()
-                    ),
-                  }
-                }
-              }
-            }
-          } else {
-            log::error!("Pre-launch: Failed to derive encryption key from os_crypt_key");
-          }
-        }
-      } else {
-        log::warn!("Pre-launch: Cookies NOT FOUND");
-      }
-    }
 
     let mut args = vec![
       format!("--remote-debugging-port={port}"),

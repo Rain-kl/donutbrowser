@@ -29,6 +29,7 @@ mod downloader;
 mod ephemeral_dirs;
 mod extension_manager;
 mod extraction;
+mod fingerprint_chromium;
 mod geoip_downloader;
 mod geolocation;
 mod group_manager;
@@ -1187,6 +1188,7 @@ async fn generate_sample_fingerprint(
     last_launch: None,
     release_type: "stable".to_string(),
     wayfern_config: None,
+    fingerprint_chromium_config: None,
     group_id: None,
     tags: Vec::new(),
     note: None,

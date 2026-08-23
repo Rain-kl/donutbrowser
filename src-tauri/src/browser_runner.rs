@@ -6,7 +6,7 @@ use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::wayfern_manager::{WayfernConfig, WayfernManager};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct BrowserRunner {
@@ -195,7 +195,18 @@ impl BrowserRunner {
     remote_debugging_port: Option<u16>,
     headless: bool,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
-    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == crate::fingerprint_chromium::BROWSER_ID {
+      return self
+        .launch_fingerprint_chromium_profile(
+          app_handle,
+          profile,
+          url,
+          remote_debugging_port,
+          headless,
+        )
+        .await;
+    }
+
     if profile.browser == "wayfern" {
       // Get or create wayfern config
       let mut wayfern_config = profile.wayfern_config.clone().unwrap_or_else(|| {
@@ -429,6 +440,23 @@ impl BrowserRunner {
         }
       }
 
+      if !extension_paths.is_empty() {
+        match enable_extensions_developer_mode(&profile_data_path) {
+          Ok(true) => log::info!(
+            "Enabled Chromium extension developer mode for profile: {}",
+            updated_profile.name
+          ),
+          Ok(false) => log::debug!(
+            "Chromium extension developer mode already enabled for profile: {}",
+            updated_profile.name
+          ),
+          Err(e) => log::warn!(
+            "Failed to enable Chromium extension developer mode for profile {}: {e}",
+            updated_profile.name
+          ),
+        }
+      }
+
       // Get proxy URL from config
       let proxy_url = wayfern_config.proxy.as_deref();
 
@@ -551,6 +579,151 @@ impl BrowserRunner {
     Err(format!("Unsupported browser type: {}", profile.browser).into())
   }
 
+  async fn launch_fingerprint_chromium_profile(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile: &BrowserProfile,
+    url: Option<String>,
+    remote_debugging_port: Option<u16>,
+    headless: bool,
+  ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = profile
+      .fingerprint_chromium_config
+      .clone()
+      .unwrap_or_else(|| {
+        crate::fingerprint_chromium::FingerprintChromiumConfig::for_profile(&profile.id)
+      });
+    if config.seed == 0 {
+      config.seed = crate::fingerprint_chromium::stable_seed(&profile.id);
+    }
+
+    let mut upstream_proxy = self
+      .resolve_launch_proxy(profile)
+      .await
+      .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+    if upstream_proxy.is_none() {
+      if let Some(vpn_id) = profile.vpn_id.as_deref() {
+        let vpn_worker = crate::vpn_worker_runner::start_vpn_worker(vpn_id)
+          .await
+          .map_err(|error| format!("Failed to start VPN worker: {error}"))?;
+        if let Some(port) = vpn_worker.local_port {
+          upstream_proxy = Some(ProxySettings {
+            proxy_type: "socks5".to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
+            username: None,
+            password: None,
+          });
+        }
+      }
+    }
+
+    let profile_id = profile.id.to_string();
+    let blocklist_file = Self::resolve_blocklist_file(profile).await?;
+    let local_proxy = PROXY_MANAGER
+      .start_proxy(
+        app_handle.clone(),
+        upstream_proxy.as_ref(),
+        0,
+        Some(&profile_id),
+        profile.proxy_bypass_rules.clone(),
+        blocklist_file,
+        "socks5",
+      )
+      .await
+      .map_err(|error| format!("Failed to start local proxy for fingerprint-chromium: {error}"))?;
+    let proxy_url = format!("socks5://{}:{}", local_proxy.host, local_proxy.port);
+
+    let geo_signature = WayfernManager::geo_signature(
+      upstream_proxy.as_ref(),
+      profile.vpn_id.as_deref(),
+      config.geoip.as_ref(),
+    );
+    if config.geo_proxy_signature.as_deref() != Some(geo_signature.as_str()) {
+      let geo_disabled = matches!(config.geoip, Some(serde_json::Value::Bool(false)));
+      if geo_disabled || config.refresh_geolocation(Some(&proxy_url)).await {
+        config.geo_proxy_signature = Some(geo_signature);
+      }
+    }
+
+    if profile.password_protected {
+      crate::profile::password::prepare_for_launch(profile)
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+    } else if profile.ephemeral {
+      crate::ephemeral_dirs::create_ephemeral_dir(&profile_id)
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+    }
+
+    let profiles_dir = self.profile_manager.get_profiles_dir();
+    let profile_data_path =
+      crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
+    let profile_path = profile_data_path.to_string_lossy().to_string();
+    let extension_paths = if profile.extension_group_id.is_some() {
+      let manager = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
+      manager
+        .install_extensions_for_profile(profile, &profile_data_path)
+        .map_err(|error| format!("Failed to prepare Chromium extensions: {error}"))?
+    } else {
+      Vec::new()
+    };
+    if !extension_paths.is_empty() {
+      if let Err(error) = enable_extensions_developer_mode(&profile_data_path) {
+        log::warn!(
+          "Failed to enable extension developer mode for fingerprint-chromium profile {}: {error}",
+          profile.name
+        );
+      }
+    }
+
+    let launch_result = self
+      .wayfern_manager
+      .launch_fingerprint_chromium(
+        profile,
+        &profile_path,
+        &config,
+        url.as_deref(),
+        Some(&proxy_url),
+        profile.ephemeral,
+        &extension_paths,
+        remote_debugging_port,
+        headless,
+      )
+      .await?;
+    let process_id = launch_result.processId.unwrap_or(0);
+
+    let mut updated_profile = profile.clone();
+    updated_profile.fingerprint_chromium_config = Some(config);
+    updated_profile.process_id = Some(process_id);
+    updated_profile.last_launch = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+
+    if let Err(error) = PROXY_MANAGER.update_proxy_pid(0, process_id) {
+      log::warn!("Failed to update proxy PID mapping: {error}");
+    }
+    PROXY_MANAGER.set_browser_pid_for_profile(&profile_id, process_id);
+    self.save_process_info(&updated_profile)?;
+    let _ = crate::tag_manager::TAG_MANAGER.lock().map(|manager| {
+      let _ =
+        manager.rebuild_from_profiles(&self.profile_manager.list_profiles().unwrap_or_default());
+    });
+
+    let _ = events::emit_empty("profiles-changed");
+    let _ = events::emit("profile-updated", &updated_profile);
+    #[derive(Serialize)]
+    struct RunningChangedPayload {
+      id: String,
+      is_running: bool,
+    }
+    let _ = events::emit(
+      "profile-running-changed",
+      &RunningChangedPayload {
+        id: profile_id,
+        is_running: true,
+      },
+    );
+
+    Ok(updated_profile)
+  }
+
   pub async fn open_url_in_existing_browser(
     &self,
     _app_handle: tauri::AppHandle,
@@ -558,8 +731,11 @@ impl BrowserRunner {
     url: &str,
     _internal_proxy_settings: Option<&ProxySettings>,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Handle Wayfern profiles using WayfernManager
-    if profile.browser == "wayfern" {
+    // Both Chromium backends share the same local CDP process registry.
+    if matches!(
+      profile.browser.as_str(),
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+    ) {
       let profiles_dir = self.profile_manager.get_profiles_dir();
       let profile_data_path =
         crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
@@ -586,7 +762,7 @@ impl BrowserRunner {
           return Ok(());
         }
         None => {
-          return Err("Wayfern browser is not running".into());
+          return Err("Chromium browser is not running".into());
         }
       }
     }
@@ -769,8 +945,11 @@ impl BrowserRunner {
     app_handle: tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Handle Wayfern profiles using WayfernManager
-    if profile.browser == "wayfern" {
+    // Chromium backends share the same detached process registry.
+    if matches!(
+      profile.browser.as_str(),
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+    ) {
       let profiles_dir = self.profile_manager.get_profiles_dir();
       let profile_data_path =
         crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
@@ -1411,6 +1590,278 @@ pub async fn kill_browser_profile(
 
       Err(format!("Failed to kill browser: {e}"))
     }
+  }
+}
+
+fn enable_extensions_developer_mode(
+  profile_data_path: &Path,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+  let device_id = chromium_pref_device_id()?;
+  enable_extensions_developer_mode_with_device_id(profile_data_path, &device_id)
+}
+
+fn enable_extensions_developer_mode_with_device_id(
+  profile_data_path: &Path,
+  device_id: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+  const DEVELOPER_MODE_PREF: &str = "extensions.ui.developer_mode";
+
+  let default_dir = profile_data_path.join("Default");
+  std::fs::create_dir_all(&default_dir)?;
+
+  let secure_preferences_path = default_dir.join("Secure Preferences");
+  let mut secure_preferences = if secure_preferences_path.exists() {
+    let contents = std::fs::read(&secure_preferences_path)?;
+    if contents.iter().all(|b| b.is_ascii_whitespace()) {
+      serde_json::json!({})
+    } else {
+      serde_json::from_slice(&contents)?
+    }
+  } else {
+    serde_json::json!({})
+  };
+
+  if !secure_preferences.is_object() {
+    secure_preferences = serde_json::json!({});
+  }
+
+  let expected_mac = chromium_pref_hash(device_id, DEVELOPER_MODE_PREF, &serde_json::json!(true))?;
+  let root = secure_preferences
+    .as_object_mut()
+    .expect("secure preferences value was normalized to an object");
+
+  let developer_mode_enabled = root
+    .get("extensions")
+    .and_then(serde_json::Value::as_object)
+    .and_then(|extensions| extensions.get("ui"))
+    .and_then(serde_json::Value::as_object)
+    .and_then(|ui| ui.get("developer_mode"))
+    .and_then(serde_json::Value::as_bool)
+    == Some(true);
+  let existing_mac = root
+    .get("protection")
+    .and_then(serde_json::Value::as_object)
+    .and_then(|protection| protection.get("macs"))
+    .and_then(serde_json::Value::as_object)
+    .and_then(|macs| macs.get("extensions"))
+    .and_then(serde_json::Value::as_object)
+    .and_then(|extensions| extensions.get("ui"))
+    .and_then(serde_json::Value::as_object)
+    .and_then(|ui| ui.get("developer_mode"))
+    .and_then(serde_json::Value::as_str);
+
+  if developer_mode_enabled && existing_mac == Some(expected_mac.as_str()) {
+    return Ok(false);
+  }
+
+  object_entry(object_entry(root, "extensions"), "ui")
+    .insert("developer_mode".to_string(), serde_json::Value::Bool(true));
+  object_entry(
+    object_entry(
+      object_entry(object_entry(root, "protection"), "macs"),
+      "extensions",
+    ),
+    "ui",
+  )
+  .insert(
+    "developer_mode".to_string(),
+    serde_json::Value::String(expected_mac),
+  );
+
+  std::fs::write(
+    &secure_preferences_path,
+    serde_json::to_vec(&secure_preferences)?,
+  )?;
+
+  Ok(true)
+}
+
+fn object_entry<'a>(
+  object: &'a mut serde_json::Map<String, serde_json::Value>,
+  key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+  let value = object
+    .entry(key.to_string())
+    .or_insert_with(|| serde_json::json!({}));
+  if !value.is_object() {
+    *value = serde_json::json!({});
+  }
+  value
+    .as_object_mut()
+    .expect("value was normalized to an object")
+}
+
+fn chromium_pref_hash(
+  device_id: &str,
+  pref_path: &str,
+  value: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+  use ring::hmac;
+
+  let value = serde_json::to_string(value)?;
+  let payload = format!("{device_id}{pref_path}{value}");
+  let key = hmac::Key::new(hmac::HMAC_SHA256, b"");
+  let tag = hmac::sign(&key, payload.as_bytes());
+  let mut mac = String::with_capacity(tag.as_ref().len() * 2);
+  const HEX: &[u8; 16] = b"0123456789ABCDEF";
+  for byte in tag.as_ref() {
+    mac.push(HEX[(byte >> 4) as usize] as char);
+    mac.push(HEX[(byte & 0x0f) as usize] as char);
+  }
+  Ok(mac)
+}
+
+#[cfg(target_os = "windows")]
+fn chromium_pref_device_id() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+  use windows::core::{PCWSTR, PWSTR};
+  use windows::Win32::Security::{
+    GetSidIdentifierAuthority, GetSidSubAuthority, GetSidSubAuthorityCount, IsValidSid,
+    LookupAccountNameW, PSID, SID, SID_NAME_USE,
+  };
+  use windows::Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW};
+
+  let mut computer_name = vec![0u16; 256];
+  let mut computer_name_len = computer_name.len() as u32;
+  unsafe {
+    GetComputerNameExW(
+      ComputerNameNetBIOS,
+      Some(PWSTR::from_raw(computer_name.as_mut_ptr())),
+      &mut computer_name_len,
+    )?;
+  }
+  computer_name.truncate(computer_name_len as usize);
+  computer_name.push(0);
+
+  let account_name = PCWSTR::from_raw(computer_name.as_ptr());
+  let mut sid_size = 0;
+  let mut domain_size = 0;
+  let mut sid_name_use = SID_NAME_USE::default();
+  unsafe {
+    let _ = LookupAccountNameW(
+      PCWSTR::null(),
+      account_name,
+      None,
+      &mut sid_size,
+      None,
+      &mut domain_size,
+      &mut sid_name_use,
+    );
+  }
+  if sid_size == 0 {
+    return Err("Windows did not return a computer SID size".into());
+  }
+
+  let mut sid_bytes = vec![0u8; sid_size as usize];
+  let mut domain = vec![0u16; domain_size.max(1) as usize];
+  let sid = PSID(sid_bytes.as_mut_ptr().cast());
+  unsafe {
+    LookupAccountNameW(
+      PCWSTR::null(),
+      account_name,
+      Some(sid),
+      &mut sid_size,
+      Some(PWSTR::from_raw(domain.as_mut_ptr())),
+      &mut domain_size,
+      &mut sid_name_use,
+    )?;
+  }
+  if !unsafe { IsValidSid(sid) }.as_bool() {
+    return Err("Windows returned an invalid computer SID".into());
+  }
+
+  let sid_header = unsafe { &*sid.0.cast::<SID>() };
+  let identifier_authority = unsafe { &*GetSidIdentifierAuthority(sid) };
+  let authority = identifier_authority
+    .Value
+    .iter()
+    .fold(0u64, |result, byte| (result << 8) | u64::from(*byte));
+  let sub_authority_count = unsafe { *GetSidSubAuthorityCount(sid) };
+  let mut sid_string = format!("S-{}-{authority}", sid_header.Revision);
+  for index in 0..sub_authority_count {
+    let sub_authority = unsafe { *GetSidSubAuthority(sid, u32::from(index)) };
+    sid_string.push_str(&format!("-{sub_authority}"));
+  }
+
+  Ok(sid_string)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn chromium_pref_device_id() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+  Err("Chromium extension developer mode persistence is currently supported on Windows".into())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{chromium_pref_hash, enable_extensions_developer_mode_with_device_id};
+
+  const DEVICE_ID: &str = "S-1-5-21-1-2-3";
+  const DEVELOPER_MODE_MAC: &str =
+    "291642CCBC5692DC2B9B836EEAA2A3023929A44C8D5080E96CF3F6C4321C12B5";
+
+  #[test]
+  fn computes_wayfern_developer_mode_mac() {
+    assert_eq!(
+      chromium_pref_hash(
+        DEVICE_ID,
+        "extensions.ui.developer_mode",
+        &serde_json::json!(true)
+      )
+      .unwrap(),
+      DEVELOPER_MODE_MAC
+    );
+  }
+
+  #[test]
+  fn enables_extension_developer_mode_without_dropping_secure_preferences() {
+    let profile_dir = tempfile::tempdir().unwrap();
+    let default_dir = profile_dir.path().join("Default");
+    std::fs::create_dir_all(&default_dir).unwrap();
+    let preferences_path = default_dir.join("Secure Preferences");
+    std::fs::write(
+      &preferences_path,
+      r#"{"extensions":{"alerts":{"initialized":true}},"protection":{"super_mac":"keep-me"}}"#,
+    )
+    .unwrap();
+
+    assert!(
+      enable_extensions_developer_mode_with_device_id(profile_dir.path(), DEVICE_ID).unwrap()
+    );
+
+    let preferences: serde_json::Value =
+      serde_json::from_slice(&std::fs::read(preferences_path).unwrap()).unwrap();
+    assert_eq!(
+      preferences["extensions"]["ui"]["developer_mode"],
+      serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+      preferences["extensions"]["alerts"]["initialized"],
+      serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+      preferences["protection"]["macs"]["extensions"]["ui"]["developer_mode"],
+      serde_json::Value::String(DEVELOPER_MODE_MAC.to_string())
+    );
+    assert_eq!(
+      preferences["protection"]["super_mac"],
+      serde_json::Value::String("keep-me".to_string())
+    );
+  }
+
+  #[test]
+  fn leaves_secure_preferences_unchanged_when_value_and_mac_are_valid() {
+    let profile_dir = tempfile::tempdir().unwrap();
+    let default_dir = profile_dir.path().join("Default");
+    std::fs::create_dir_all(&default_dir).unwrap();
+    let preferences_path = default_dir.join("Secure Preferences");
+    let original = format!(
+      r#"{{"extensions":{{"ui":{{"developer_mode":true}}}},"protection":{{"macs":{{"extensions":{{"ui":{{"developer_mode":"{DEVELOPER_MODE_MAC}"}}}}}}}}}}"#
+    );
+    std::fs::write(&preferences_path, &original).unwrap();
+
+    assert!(
+      !enable_extensions_developer_mode_with_device_id(profile_dir.path(), DEVICE_ID).unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(preferences_path).unwrap(), original);
   }
 }
 
