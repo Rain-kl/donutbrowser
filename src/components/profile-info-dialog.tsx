@@ -339,6 +339,8 @@ export function ProfileInfoDialog({
 
   const ProfileIcon = getProfileIcon(profile);
   const isWayfern = profile.browser === "wayfern";
+  const isFingerprintBrowser =
+    isWayfern || profile.browser === "fingerprint_chromium";
   const isDeleteDisabled = isRunning;
 
   const proxyName = profile.proxy_id
@@ -435,10 +437,10 @@ export function ProfileInfoDialog({
         handleAction(() => onConfigureWayfern?.(profile));
       },
       // Viewing and editing fingerprints both require an active paid plan.
-      disabled: isDisabled || !crossOsUnlocked,
-      proBadge: !crossOsUnlocked,
+      disabled: isDisabled || (isWayfern && !crossOsUnlocked),
+      proBadge: isWayfern && !crossOsUnlocked,
       runningBadge: isRunning,
-      hidden: !isWayfern || !onConfigureWayfern,
+      hidden: !isFingerprintBrowser || !onConfigureWayfern,
     },
     {
       icon: <LuUsers className="size-4" />,
@@ -460,7 +462,9 @@ export function ProfileInfoDialog({
       disabled: isDisabled,
       runningBadge: isRunning,
       hidden:
-        !isWayfern || profile.ephemeral === true || !onCopyCookiesToProfile,
+        !isFingerprintBrowser ||
+        profile.ephemeral === true ||
+        !onCopyCookiesToProfile,
     },
     {
       id: "cookiesManage",
@@ -1764,6 +1768,23 @@ function CookiesSectionInline({
 
 // Inline password set / change / remove form. Replaces three separate
 // nested modal dialogs with one in-page form that branches on the current
+function sharedFingerprintConfig(profile: BrowserProfile): WayfernConfig {
+  if (
+    profile.browser === "fingerprint_chromium" &&
+    profile.fingerprint_chromium_config
+  ) {
+    const config = profile.fingerprint_chromium_config;
+    return {
+      os: config.platform,
+      geoip: config.geoip,
+      block_images: config.block_images,
+      block_webrtc: config.disable_non_proxied_udp,
+      block_webgl: config.block_webgl,
+    };
+  }
+  return profile.wayfern_config ?? {};
+}
+
 // `password_protected` state of the profile.
 // Inline fingerprint editor. Reuses SharedFingerprintConfigForm so the same
 // field set as the standalone dialog is available without opening a nested modal.
@@ -1780,22 +1801,24 @@ function FingerprintSectionInline({
   onSaved: () => void;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
-  const [wayfernConfig, setWayfernConfig] = React.useState<WayfernConfig>(
-    () => profile.wayfern_config ?? {},
+  const [wayfernConfig, setWayfernConfig] = React.useState<WayfernConfig>(() =>
+    sharedFingerprintConfig(profile),
   );
   const [isSaving, setIsSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [success, setSuccess] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    setWayfernConfig(profile.wayfern_config ?? {});
+    setWayfernConfig(sharedFingerprintConfig(profile));
     setError(null);
     setSuccess(null);
-  }, [profile.wayfern_config]);
+  }, [profile]);
 
   const isWayfern = profile.browser === "wayfern";
+  const isFingerprintBrowser =
+    isWayfern || profile.browser === "fingerprint_chromium";
 
-  if (!isWayfern) {
+  if (!isFingerprintBrowser) {
     return (
       <div className="flex flex-col gap-3">
         <div className="flex items-center gap-2 text-sm font-semibold">
@@ -1809,7 +1832,7 @@ function FingerprintSectionInline({
     );
   }
 
-  if (!crossOsUnlocked) {
+  if (isWayfern && !crossOsUnlocked) {
     return (
       <div className="flex flex-col items-center gap-3 rounded-lg border p-6 text-center">
         <LuLock className="size-4 shrink-0 text-muted-foreground" />
@@ -1846,7 +1869,7 @@ function FingerprintSectionInline({
     }
   };
 
-  const initial = JSON.stringify(profile.wayfern_config ?? {});
+  const initial = JSON.stringify(sharedFingerprintConfig(profile));
   const current = JSON.stringify(wayfernConfig);
   const dirty = current !== initial;
 
@@ -1865,8 +1888,8 @@ function FingerprintSectionInline({
         onConfigChange={onWayfernChange}
         forceAdvanced={true}
         readOnly={isDisabled}
-        crossOsUnlocked={crossOsUnlocked}
-        limitedMode={false}
+        crossOsUnlocked={isWayfern && crossOsUnlocked}
+        limitedMode={!isWayfern}
         profileVersion={profile.version}
         profileBrowser={profile.browser}
       />
@@ -1891,7 +1914,7 @@ function FingerprintSectionInline({
             variant="ghost"
             className="h-7 text-xs"
             onClick={() => {
-              setWayfernConfig(profile.wayfern_config ?? {});
+              setWayfernConfig(sharedFingerprintConfig(profile));
               setError(null);
               setSuccess(null);
             }}

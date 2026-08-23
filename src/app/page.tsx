@@ -79,7 +79,7 @@ import {
 } from "@/lib/toast-utils";
 import type { BrowserProfile, SyncSettings, WayfernConfig } from "@/types";
 
-type BrowserTypeString = "wayfern";
+type BrowserTypeString = "fingerprint_chromium" | "wayfern";
 
 interface PendingUrl {
   id: string;
@@ -893,7 +893,10 @@ export default function Home() {
       }
 
       // Show one-time warning about window resizing for fingerprinted browsers
-      if (profile.browser === "wayfern") {
+      if (
+        profile.browser === "wayfern" ||
+        profile.browser === "fingerprint_chromium"
+      ) {
         try {
           const dismissed = await invoke<boolean>(
             "get_window_resize_warning_dismissed",
@@ -1104,7 +1107,9 @@ export default function Home() {
   const handleBulkCopyCookies = useCallback(() => {
     if (selectedProfiles.length === 0) return;
     const eligibleProfiles = profiles.filter(
-      (p) => selectedProfiles.includes(p.id) && p.browser === "wayfern",
+      (p) =>
+        selectedProfiles.includes(p.id) &&
+        (p.browser === "wayfern" || p.browser === "fingerprint_chromium"),
     );
     if (eligibleProfiles.length === 0) {
       showErrorToast(t("errors.cookieCopyUnsupportedBrowser"));

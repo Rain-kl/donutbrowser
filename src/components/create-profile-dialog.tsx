@@ -66,7 +66,7 @@ const getCurrentOS = (): WayfernOS => {
 
 import { RippleButton } from "./ui/ripple";
 
-type BrowserTypeString = "wayfern";
+type BrowserTypeString = "fingerprint_chromium" | "wayfern";
 
 interface CreateProfileDialogProps {
   isOpen: boolean;
@@ -92,10 +92,15 @@ interface CreateProfileDialogProps {
 
 interface BrowserOption {
   value: BrowserTypeString;
-  label: string;
+  labelKey?: string;
+  label?: string;
 }
 
 const browserOptions: BrowserOption[] = [
+  {
+    value: "fingerprint_chromium",
+    labelKey: "createProfile.fingerprintChromiumLabel",
+  },
   {
     value: "wayfern",
     label: "Wayfern",
@@ -120,9 +125,10 @@ export function CreateProfileDialog({
   >("browser-config");
   const [activeTab, setActiveTab] = useState("anti-detect");
 
-  // Browser selection states. Defaults to Wayfern — the only creatable browser.
-  const [selectedBrowser, setSelectedBrowser] =
-    useState<BrowserTypeString>("wayfern");
+  // Browser selection states. Fingerprint Chromium is the default backend.
+  const [selectedBrowser, setSelectedBrowser] = useState<BrowserTypeString>(
+    "fingerprint_chromium",
+  );
   const [selectedProxyId, setSelectedProxyId] = useState<string>();
   const [proxyPopoverOpen, setProxyPopoverOpen] = useState(false);
   const [dnsBlocklist, setDnsBlocklist] = useState<string>("");
@@ -141,7 +147,7 @@ export function CreateProfileDialog({
 
   // Reset the form fields without leaving the Wayfern config step.
   const resetForm = () => {
-    setSelectedBrowser("wayfern");
+    setSelectedBrowser("fingerprint_chromium");
     setProfileName("");
     setSelectedProxyId(undefined);
     setLaunchHook("");
@@ -285,14 +291,15 @@ export function CreateProfileDialog({
   useEffect(() => {
     if (isOpen) {
       void loadSupportedBrowsers();
-      // Load downloaded Wayfern versions up front so the availability gate is accurate.
-      void loadDownloadedVersions("wayfern");
+      void loadDownloadedVersions("fingerprint_chromium");
       // Load release types when a browser is selected
       if (selectedBrowser) {
         void loadReleaseTypes(selectedBrowser);
       }
-      // Wayfern needs the GeoIP database for fingerprint generation.
-      if (selectedBrowser === "wayfern") {
+      if (
+        selectedBrowser === "wayfern" ||
+        selectedBrowser === "fingerprint_chromium"
+      ) {
         void checkAndDownloadGeoIPDatabase();
       }
     }
@@ -393,10 +400,9 @@ export function CreateProfileDialog({
         : undefined;
     try {
       if (activeTab === "anti-detect") {
-        // Only Wayfern anti-detect profiles are created.
-        const bestWayfernVersion = getCreatableVersion("wayfern");
-        if (!bestWayfernVersion) {
-          console.error("No Wayfern version available");
+        const bestVersion = getCreatableVersion(selectedBrowser);
+        if (!bestVersion) {
+          console.error(`No ${selectedBrowser} version available`);
           return;
         }
 
@@ -405,9 +411,9 @@ export function CreateProfileDialog({
 
         await onCreateProfile({
           name: profileName.trim(),
-          browserStr: "wayfern" as BrowserTypeString,
-          version: bestWayfernVersion.version,
-          releaseType: bestWayfernVersion.releaseType,
+          browserStr: selectedBrowser,
+          version: bestVersion.version,
+          releaseType: bestVersion.releaseType,
           proxyId: resolvedProxyId,
           vpnId: resolvedVpnId,
           wayfernConfig: finalWayfernConfig,
@@ -467,7 +473,7 @@ export function CreateProfileDialog({
     setProfileName("");
     setCurrentStep("browser-config");
     setActiveTab("anti-detect");
-    setSelectedBrowser("wayfern");
+    setSelectedBrowser("fingerprint_chromium");
     setSelectedProxyId(undefined);
     setLaunchHook("");
     setReleaseTypes({});
@@ -624,7 +630,9 @@ export function CreateProfileDialog({
                                 </div>
                                 <div className="text-left">
                                   <div className="font-medium">
-                                    {browser.label}
+                                    {browser.labelKey
+                                      ? t(browser.labelKey)
+                                      : browser.label}
                                   </div>
                                   <div className="text-sm text-muted-foreground">
                                     {t("createProfile.regular.badge")}
@@ -666,6 +674,38 @@ export function CreateProfileDialog({
                               "createProfile.profileNamePlaceholder",
                             )}
                           />
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label htmlFor="profile-browser">
+                            {t("profiles.table.browser")}
+                          </Label>
+                          <Select
+                            value={selectedBrowser}
+                            onValueChange={(value) => {
+                              setSelectedBrowser(value as BrowserTypeString);
+                            }}
+                          >
+                            <SelectTrigger id="profile-browser">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {browserOptions
+                                .filter((browser) =>
+                                  supportedBrowsers.includes(browser.value),
+                                )
+                                .map((browser) => (
+                                  <SelectItem
+                                    key={browser.value}
+                                    value={browser.value}
+                                  >
+                                    {browser.labelKey
+                                      ? t(browser.labelKey)
+                                      : browser.label}
+                                  </SelectItem>
+                                ))}
+                            </SelectContent>
+                          </Select>
                         </div>
 
                         {/* Ephemeral Option */}
@@ -996,6 +1036,20 @@ export function CreateProfileDialog({
                               </div>
                             )}
                           </div>
+                        )}
+
+                        {selectedBrowser === "fingerprint_chromium" && (
+                          <WayfernConfigForm
+                            config={wayfernConfig}
+                            onConfigChange={updateWayfernConfig}
+                            isCreating
+                            crossOsUnlocked={false}
+                            limitedMode
+                            profileVersion={
+                              getCreatableVersion(selectedBrowser)?.version
+                            }
+                            profileBrowser={selectedBrowser}
+                          />
                         )}
 
                         {/* Proxy / VPN Selection - Always visible */}

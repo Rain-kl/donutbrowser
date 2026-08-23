@@ -381,7 +381,8 @@
       "description": "Encrypts the on-disk profile data. Required to launch."
     },
     "downloadingSubtitle": "Downloading…",
-    "browsersDownloading": "Browsers are still downloading. Profile creation will be available once a download finishes."
+    "browsersDownloading": "Browsers are still downloading. Profile creation will be available once a download finishes.",
+    "fingerprintChromiumLabel": "Fingerprint Chromium"
   },
   "deleteDialog": {
     "title": "Delete Profile",

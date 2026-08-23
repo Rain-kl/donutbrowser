@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { getBrowserDisplayName } from "@/lib/browser-utils";
 import type { BrowserProfile, WayfernConfig, WayfernOS } from "@/types";
 import { LoadingButton } from "./loading-button";
 import { RippleButton } from "./ui/ripple";
@@ -32,6 +33,28 @@ interface WayfernConfigDialogProps {
   crossOsUnlocked?: boolean;
 }
 
+function sharedConfigForProfile(profile: BrowserProfile): WayfernConfig {
+  if (
+    profile.browser === "fingerprint_chromium" &&
+    profile.fingerprint_chromium_config
+  ) {
+    const config = profile.fingerprint_chromium_config;
+    return {
+      os: config.platform,
+      geoip: config.geoip,
+      block_images: config.block_images,
+      block_webrtc: config.disable_non_proxied_udp,
+      block_webgl: config.block_webgl,
+    };
+  }
+  return (
+    profile.wayfern_config || {
+      geoip: true,
+      os: getCurrentOS(),
+    }
+  );
+}
+
 export function WayfernConfigDialog({
   isOpen,
   onClose,
@@ -48,13 +71,11 @@ export function WayfernConfigDialog({
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
-    if (profile?.browser === "wayfern") {
-      setConfig(
-        profile.wayfern_config || {
-          geoip: true,
-          os: getCurrentOS(),
-        },
-      );
+    if (
+      profile?.browser === "wayfern" ||
+      profile?.browser === "fingerprint_chromium"
+    ) {
+      setConfig(sharedConfigForProfile(profile));
     }
   }, [profile]);
 
@@ -96,18 +117,19 @@ export function WayfernConfigDialog({
   };
 
   const handleClose = () => {
-    if (profile?.browser === "wayfern") {
-      setConfig(
-        profile.wayfern_config || {
-          geoip: true,
-          os: getCurrentOS(),
-        },
-      );
+    if (
+      profile?.browser === "wayfern" ||
+      profile?.browser === "fingerprint_chromium"
+    ) {
+      setConfig(sharedConfigForProfile(profile));
     }
     onClose();
   };
 
-  if (profile?.browser !== "wayfern") {
+  if (
+    profile?.browser !== "wayfern" &&
+    profile?.browser !== "fingerprint_chromium"
+  ) {
     return null;
   }
 
@@ -119,11 +141,11 @@ export function WayfernConfigDialog({
             {isRunning
               ? t("wayfernConfigDialog.titleView", {
                   name: profile.name,
-                  browser: "Wayfern",
+                  browser: getBrowserDisplayName(profile.browser),
                 })
               : t("wayfernConfigDialog.titleConfigure", {
                   name: profile.name,
-                  browser: "Wayfern",
+                  browser: getBrowserDisplayName(profile.browser),
                 })}
           </DialogTitle>
         </DialogHeader>
@@ -135,10 +157,12 @@ export function WayfernConfigDialog({
               onConfigChange={updateConfig}
               forceAdvanced={true}
               readOnly={isRunning}
-              crossOsUnlocked={crossOsUnlocked}
-              limitedMode={!crossOsUnlocked}
+              crossOsUnlocked={profile.browser === "wayfern" && crossOsUnlocked}
+              limitedMode={
+                profile.browser === "fingerprint_chromium" || !crossOsUnlocked
+              }
               profileVersion={profile.version}
-              profileBrowser="wayfern"
+              profileBrowser={profile.browser}
             />
           </div>
         </ScrollArea>

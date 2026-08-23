@@ -23,6 +23,7 @@ export interface BrowserProfile {
   last_launch?: number;
   release_type: string;
   wayfern_config?: WayfernConfig; // Wayfern configuration
+  fingerprint_chromium_config?: FingerprintChromiumConfig;
   group_id?: string; // Reference to profile group
   tags?: string[];
   note?: string; // User note
@@ -238,6 +239,23 @@ export interface WayfernConfig {
   randomize_fingerprint_on_launch?: boolean; // Generate new fingerprint on every launch
   os?: WayfernOS; // Operating system for fingerprint generation
   geo_proxy_signature?: string; // Internal: routing the fingerprint's location was computed for
+}
+
+export interface FingerprintChromiumConfig {
+  seed: number;
+  platform: "windows" | "macos" | "linux";
+  platform_version?: string;
+  brand: string;
+  brand_version?: string;
+  hardware_concurrency?: number;
+  timezone?: string;
+  languages: string[];
+  disable_non_proxied_udp: boolean;
+  disabled_spoofing: string[];
+  geoip?: string | boolean;
+  block_images?: boolean;
+  block_webgl?: boolean;
+  geo_proxy_signature?: string;
 }
 
 // Wayfern fingerprint config - matches the C++ FingerprintData structure

@@ -11,6 +11,7 @@ import { LuLock } from "react-icons/lu";
  */
 export function getBrowserDisplayName(browserType: string): string {
   const browserNames: Record<string, string> = {
+    fingerprint_chromium: "Fingerprint Chromium",
     wayfern: "Wayfern",
   };
 
@@ -24,6 +25,7 @@ export function getBrowserDisplayName(browserType: string): string {
  */
 export function getBrowserIcon(browserType: string) {
   switch (browserType) {
+    case "fingerprint_chromium":
     case "wayfern":
       return FaChrome;
     default:
@@ -58,8 +60,12 @@ export const getCurrentOS = () => {
 export function isCrossOsProfile(profile: {
   host_os?: string;
   wayfern_config?: { os?: string };
+  fingerprint_chromium_config?: { platform?: string };
 }): boolean {
-  const profileOs = profile.host_os || profile.wayfern_config?.os;
+  const profileOs =
+    profile.host_os ||
+    profile.fingerprint_chromium_config?.platform ||
+    profile.wayfern_config?.os;
   if (!profileOs) return false;
   return profileOs !== getCurrentOS();
 }
