@@ -44,6 +44,52 @@ if (!cmd) {
   process.exit(2);
 }
 
+const SELF_HOSTED_AUTOMATION_FEATURE = "self-hosted-browser-automation";
+
+function withTauriDevDefaults(command, commandArgs) {
+  if (!/(^|[\\/])tauri(?:\.cmd)?$/i.test(command) || commandArgs[0] !== "dev") {
+    return commandArgs;
+  }
+
+  const resolvedArgs = [...commandArgs];
+  const optionBoundary = resolvedArgs.indexOf("--");
+  const optionArgs =
+    optionBoundary === -1
+      ? resolvedArgs
+      : resolvedArgs.slice(0, optionBoundary);
+
+  if (!optionArgs.includes("--no-watch")) {
+    resolvedArgs.splice(1, 0, "--no-watch");
+  }
+
+  const updatedBoundary = resolvedArgs.indexOf("--");
+  const updatedOptionArgs =
+    updatedBoundary === -1
+      ? resolvedArgs
+      : resolvedArgs.slice(0, updatedBoundary);
+  const hasAutomationFeature = updatedOptionArgs.some((arg) =>
+    arg
+      .replace(/^--features=/, "")
+      .split(",")
+      .includes(SELF_HOSTED_AUTOMATION_FEATURE),
+  );
+
+  if (!hasAutomationFeature) {
+    const featuresIndex = updatedOptionArgs.findIndex(
+      (arg) => arg === "--features" || arg === "-f",
+    );
+    if (featuresIndex === -1) {
+      resolvedArgs.splice(1, 0, "--features", SELF_HOSTED_AUTOMATION_FEATURE);
+    } else {
+      resolvedArgs.splice(featuresIndex + 1, 0, SELF_HOSTED_AUTOMATION_FEATURE);
+    }
+  }
+
+  return resolvedArgs;
+}
+
+const resolvedArgs = withTauriDevDefaults(cmd, args);
+
 // On Windows, npm-installed bins (e.g. `tauri`) are `.cmd` shims that cannot be
 // launched with `shell: false` — Node refuses to exec a batch file directly and
 // the spawn fails with ENOENT/EINVAL. Run through the shell on Windows (cmd.exe
@@ -52,8 +98,8 @@ if (!cmd) {
 // whitespace so paths with spaces aren't split into multiple arguments.
 const isWindows = process.platform === "win32";
 const spawnArgs = isWindows
-  ? args.map((a) => (/\s/.test(a) ? `"${a}"` : a))
-  : args;
+  ? resolvedArgs.map((a) => (/\s/.test(a) ? `"${a}"` : a))
+  : resolvedArgs;
 const child = spawn(cmd, spawnArgs, { stdio: "inherit", shell: isWindows });
 child.on("error", (err) => {
   console.error(`Failed to spawn ${cmd}:`, err.message);

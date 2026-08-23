@@ -186,3 +186,6 @@ default = ["custom-protocol"]
 # this feature is used used for production builds where `devPath` points to the filesystem
 # DO NOT remove this
 custom-protocol = ["tauri/custom-protocol"]
+# Enables local API and MCP browser automation without cloud entitlements.
+# Intended for authorized self-hosted/community distributions.
+self-hosted-browser-automation = []

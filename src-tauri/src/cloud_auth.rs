@@ -779,6 +779,10 @@ impl CloudAuthManager {
 
   /// Launch/drive profiles programmatically (local API + MCP automation).
   pub async fn can_use_browser_automation(&self) -> bool {
+    if cfg!(feature = "self-hosted-browser-automation") {
+      return true;
+    }
+
     self
       .entitlements()
       .await
@@ -1648,4 +1652,24 @@ pub async fn restart_sync_service(app_handle: tauri::AppHandle) -> Result<(), St
   });
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn browser_automation_uses_the_selected_entitlement_provider() {
+    let manager = CloudAuthManager {
+      client: Client::new(),
+      state: Mutex::new(None),
+      refresh_lock: tokio::sync::Mutex::new(()),
+      wayfern_token: Mutex::new(None),
+    };
+
+    assert_eq!(
+      manager.can_use_browser_automation().await,
+      cfg!(feature = "self-hosted-browser-automation")
+    );
+  }
 }
